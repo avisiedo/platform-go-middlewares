@@ -9,8 +9,6 @@ import (
 	"net/http"
 )
 
-type identityKey int
-
 // Internal is the "internal" field of an XRHID
 type Internal struct {
 	OrgID       string  `json:"org_id"`
@@ -72,8 +70,30 @@ type XRHID struct {
 	Identity Identity `json:"identity"`
 }
 
-// Key the key for the XRHID in that gets added to the context
-const Key identityKey = iota
+// IdentityConfig gather the options for the Identity middleware
+type IdentityConfig struct {
+	// Function that evaluate true for the request to bypass or
+	// false for the request to check the identity; by default
+	// no request is skipped.
+	Skipper func(r *http.Request) bool
+	// Function that allow to add additional checks to the identity
+	// validation; by default no additional checks are performed.
+	Validator func(identity *XRHID) bool
+}
+
+// The header where the identity is read from
+const XRHIdentityHeader = "X-Rh-Identity"
+
+// The key for the XRHID in that gets added to the context
+const Key string = "x-rh-identity"
+
+func DefaultSkipper(r *http.Request) bool {
+	return false
+}
+
+func DefaultValidator(identity *XRHID) bool {
+	return true
+}
 
 func getErrorText(code int, reason string) string {
 	return http.StatusText(code) + ": " + reason
@@ -110,11 +130,11 @@ func checkHeader(id *XRHID, w http.ResponseWriter) error {
 	}
 
 	if id.Identity.OrgID == "" && id.Identity.Internal.OrgID == "" {
-		return doError(w, 400, "x-rh-identity header has an invalid or missing org_id")
+		return doError(w, 400, XRHIdentityHeader+" header has an invalid or missing org_id")
 	}
 
 	if id.Identity.Type == "" {
-		return doError(w, 400, "x-rh-identity header is missing type")
+		return doError(w, 400, XRHIdentityHeader+" header is missing type")
 	}
 
 	return nil
@@ -123,40 +143,65 @@ func checkHeader(id *XRHID, w http.ResponseWriter) error {
 // EnforceIdentity extracts the X-Rh-Identity header and places the contents into the
 // request context.  If the Identity is invalid, the request will be aborted.
 func EnforceIdentity(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		rawHeaders := r.Header["X-Rh-Identity"]
+	return EnforceIdentityWithConfig(IdentityConfig{
+		Skipper:   DefaultSkipper,
+		Validator: DefaultValidator,
+	})(next)
+}
 
-		// must have an x-rh-id header
-		if len(rawHeaders) != 1 {
-			doError(w, 400, "missing x-rh-identity header")
-			return
-		}
+func EnforceIdentityWithConfig(config IdentityConfig) func(http.Handler) http.Handler {
+	if config.Skipper == nil {
+		config.Skipper = DefaultSkipper
+	}
+	if config.Validator == nil {
+		config.Validator = DefaultValidator
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Call custom skipper
+			if config.Skipper(r) {
+				return
+			}
+			rawHeaders := r.Header[XRHIdentityHeader]
 
-		// must be able to base64 decode header
-		idRaw, err := base64.StdEncoding.DecodeString(rawHeaders[0])
-		if err != nil {
-			doError(w, 400, "unable to b64 decode x-rh-identity header")
-			return
-		}
+			// must have one x-rh-identity header
+			if len(rawHeaders) != 1 {
+				doError(w, 400, "missing "+XRHIdentityHeader+" header")
+				return
+			}
 
-		var jsonData XRHID
-		err = json.Unmarshal(idRaw, &jsonData)
-		if err != nil {
-			log.Printf("unable to unmarshal x-rh-identity header: %s", err)
-			doError(w, 400, "x-rh-identity header does not contain valid JSON")
-			return
-		}
+			// must be able to base64 decode header
+			idRaw, err := base64.StdEncoding.DecodeString(rawHeaders[0])
+			if err != nil {
+				doError(w, 400, "unable to b64 decode "+XRHIdentityHeader+" header")
+				return
+			}
 
-		topLevelOrgIDFallback(&jsonData)
+			var jsonData XRHID
+			err = json.Unmarshal(idRaw, &jsonData)
+			if err != nil {
+				log.Printf("unable to unmarshal "+XRHIdentityHeader+" header: %s", err)
+				doError(w, 400, XRHIdentityHeader+" header does not contain valid JSON")
+				return
+			}
 
-		err = checkHeader(&jsonData, w)
-		if err != nil {
-			return
-		}
+			topLevelOrgIDFallback(&jsonData)
 
-		ctx := context.WithValue(r.Context(), Key, jsonData)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
+			err = checkHeader(&jsonData, w)
+			if err != nil {
+				return
+			}
+
+			// Call custom validator
+			if !config.Validator(&jsonData) {
+				doError(w, 400, XRHIdentityHeader+" header does not passed custom validation")
+				return
+			}
+
+			ctx := context.WithValue(r.Context(), Key, jsonData)
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
 }
 
 // if org_id is not defined at the top level, use the internal one
